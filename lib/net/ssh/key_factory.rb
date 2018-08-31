@@ -109,7 +109,7 @@ module Net
         # Determine whether the file describes an RSA or DSA key, and return how load it
         # appropriately.
         def classify_key(data, filename)
-          if data.match(/-----BEGIN OPENSSH PRIVATE KEY-----/)
+          if data.match(/-----BEGIN OPENSSH PRIVATE KEY-----/) || data.match(/-----BEGIN PRIVATE KEY-----/)
             Net::SSH::Authentication::ED25519Loader.raiseUnlessLoaded("OpenSSH keys only supported if ED25519 is available")
             return ->(key_data, passphrase) { Net::SSH::Authentication::ED25519::PrivKey.read(key_data, passphrase) }, [ArgumentError]
           elsif OpenSSL::PKey.respond_to?(:read)

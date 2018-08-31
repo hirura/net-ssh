@@ -60,66 +60,77 @@ module Net
         class PrivKey
           CipherFactory = Net::SSH::Transport::CipherFactory
 
-          MBEGIN = "-----BEGIN OPENSSH PRIVATE KEY-----\n"
-          MEND = "-----END OPENSSH PRIVATE KEY-----\n"
-          MAGIC = "openssh-key-v1"
+          OPENSSL_MBEGIN = "-----BEGIN PRIVATE KEY-----\n"
+          OPENSSL_MEND = "-----END PRIVATE KEY-----\n"
+          OPENSSH_MBEGIN = "-----BEGIN OPENSSH PRIVATE KEY-----\n"
+          OPENSSH_MEND = "-----END OPENSSH PRIVATE KEY-----\n"
+          OPENSSH_MAGIC = "openssh-key-v1"
 
           attr_reader :sign_key
 
           def initialize(datafull,password)
-            raise ArgumentError.new("Expected #{MBEGIN} at start of private key") unless datafull.start_with?(MBEGIN)
-            raise ArgumentError.new("Expected #{MEND} at end of private key") unless datafull.end_with?(MEND)
-            datab64 = datafull[MBEGIN.size...-MEND.size]
-            data = Base64.decode64(datab64)
-            raise ArgumentError.new("Expected #{MAGIC} at start of decoded private key") unless data.start_with?(MAGIC)
-            buffer = Net::SSH::Buffer.new(data[MAGIC.size + 1..-1])
-
-            ciphername = buffer.read_string
-            raise ArgumentError.new("#{ciphername} in private key is not supported") unless
-              CipherFactory.supported?(ciphername)
-
-            kdfname = buffer.read_string
-            raise ArgumentError.new("Expected #{kdfname} to be or none or bcrypt") unless %w[none bcrypt].include?(kdfname)
-
-            kdfopts = Net::SSH::Buffer.new(buffer.read_string)
-            num_keys = buffer.read_long
-            raise ArgumentError.new("Only 1 key is supported in ssh keys #{num_keys} was in private key") unless num_keys == 1
-            _pubkey = buffer.read_string
-
-            len = buffer.read_long
-
-            keylen, blocksize, ivlen = CipherFactory.get_lengths(ciphername, iv_len: true)
-            raise ArgumentError.new("Private key len:#{len} is not a multiple of #{blocksize}") if
-              ((len < blocksize) || ((blocksize > 0) && (len % blocksize) != 0))
-
-            if kdfname == 'bcrypt'
-              salt = kdfopts.read_string
-              rounds = kdfopts.read_long
-
-              raise "BCryptPbkdf is not implemented for jruby" if RUBY_PLATFORM == "java"
-              key = BCryptPbkdf::key(password, salt, keylen + ivlen, rounds)
+            if datafull.start_with?(OPENSSL_MBEGIN)
+              raise ArgumentError.new("Expected #{OPENSSL_MEND} at end of private key") unless datafull.end_with?(OPENSSL_MEND)
+              datab64 = datafull[OPENSSL_MBEGIN.size...-OPENSSL_MEND.size]
+              data = Base64.decode64(datab64)
+              decoded_data = OpenSSL::ASN1.decode(data)
+              sk = decoded_data.value[2].value[2..-1]
+              pk = ::Ed25519::SigningKey.new(sk).verify_key.to_bytes
+              @pk = pk
+              @sign_key = SigningKeyFromFile.new(pk, sk + pk)
             else
-              key = '\x00' * (keylen + ivlen)
+              raise ArgumentError.new("Expected #{OPENSSH_MBEGIN} at start of private key") unless datafull.start_with?(OPENSSH_MBEGIN)
+              raise ArgumentError.new("Expected #{OPENSSH_MEND} at end of private key") unless datafull.end_with?(OPENSSH_MEND)
+              datab64 = datafull[OPENSSH_MBEGIN.size...-OPENSSH_MEND.size]
+              data = Base64.decode64(datab64)
+              raise ArgumentError.new("Expected #{OPENSSH_MAGIC} at start of decoded private key") unless data.start_with?(OPENSSH_MAGIC)
+              buffer = Net::SSH::Buffer.new(data[OPENSSH_MAGIC.size + 1..-1])
+
+              ciphername = buffer.read_string
+              raise ArgumentError.new("#{ciphername} in private key is not supported") unless CipherFactory.supported?(ciphername)
+
+              kdfname = buffer.read_string
+              raise ArgumentError.new("Expected #{kdfname} to be or none or bcrypt") unless %w[none bcrypt].include?(kdfname)
+
+              kdfopts = Net::SSH::Buffer.new(buffer.read_string)
+              num_keys = buffer.read_long
+              raise ArgumentError.new("Only 1 key is supported in ssh keys #{num_keys} was in private key") unless num_keys == 1
+              _pubkey = buffer.read_string
+
+              len = buffer.read_long
+
+              keylen, blocksize, ivlen = CipherFactory.get_lengths(ciphername, iv_len: true)
+              raise ArgumentError.new("Private key len:#{len} is not a multiple of #{blocksize}") if ((len < blocksize) || ((blocksize > 0) && (len % blocksize) != 0))
+
+              if kdfname == 'bcrypt'
+                salt = kdfopts.read_string
+                rounds = kdfopts.read_long
+
+                raise "BCryptPbkdf is not implemented for jruby" if RUBY_PLATFORM == "java"
+                key = BCryptPbkdf::key(password, salt, keylen + ivlen, rounds)
+              else
+                key = '\x00' * (keylen + ivlen)
+              end
+
+              cipher = CipherFactory.get(ciphername, key: key[0...keylen], iv:key[keylen...keylen + ivlen], decrypt: true)
+
+              decoded = cipher.update(buffer.remainder_as_buffer.to_s)
+              decoded << cipher.final
+
+              decoded = Net::SSH::Buffer.new(decoded)
+              check1 = decoded.read_long
+              check2 = decoded.read_long
+
+              raise ArgumentError, "Decrypt failed on private key" if (check1 != check2)
+
+              _type_name = decoded.read_string
+              pk = decoded.read_string
+              sk = decoded.read_string
+              _comment = decoded.read_string
+
+              @pk = pk
+              @sign_key = SigningKeyFromFile.new(pk,sk)
             end
-
-            cipher = CipherFactory.get(ciphername, key: key[0...keylen], iv:key[keylen...keylen + ivlen], decrypt: true)
-
-            decoded = cipher.update(buffer.remainder_as_buffer.to_s)
-            decoded << cipher.final
-
-            decoded = Net::SSH::Buffer.new(decoded)
-            check1 = decoded.read_long
-            check2 = decoded.read_long
-
-            raise ArgumentError, "Decrypt failed on private key" if (check1 != check2)
-
-            _type_name = decoded.read_string
-            pk = decoded.read_string
-            sk = decoded.read_string
-            _comment = decoded.read_string
-
-            @pk = pk
-            @sign_key = SigningKeyFromFile.new(pk,sk)
           end
 
           def to_blob
